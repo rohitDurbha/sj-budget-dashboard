@@ -161,49 +161,71 @@ def load_compensation_data():
     return combined
 
 
+def _clean_money(series):
+    """Safely convert a money column (possibly with $, commas, quotes) to float."""
+    # If it's a DataFrame (duplicate cols), take the first one
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    return pd.to_numeric(
+        series.astype(str)
+        .apply(lambda v: v.replace(",", "").replace("$", "").replace('"', "").strip()),
+        errors="coerce"
+    ).fillna(0)
+
+
 def process_compensation(df):
     if df.empty:
         return df
 
+    # Remove duplicate columns BEFORE renaming (keep first occurrence)
+    df = df.loc[:, ~df.columns.duplicated()]
+
     # Normalize columns
     col_map = {}
+    seen_targets = set()
     for c in df.columns:
         cl = c.strip().lower()
-        if "name" == cl: col_map[c] = "name"
-        elif "department" in cl: col_map[c] = "department"
-        elif "job" in cl and "title" in cl: col_map[c] = "job_title"
-        elif "total" in cl and "cash" in cl: col_map[c] = "total_comp"
-        elif "base" in cl and "pay" in cl: col_map[c] = "base_pay"
-        elif "overtime" in cl: col_map[c] = "overtime"
-        elif "sick" in cl or "vacation" in cl: col_map[c] = "sick_vacation"
-        elif "other" in cl and "cash" in cl: col_map[c] = "other_cash"
-        elif "defined" in cl or "contribution" in cl and "plan" in cl: col_map[c] = "dc_contributions"
-        elif "medical" in cl or "dental" in cl: col_map[c] = "medical_dental"
-        elif "retirement" in cl: col_map[c] = "retirement"
-        elif "long" in cl and "term" in cl: col_map[c] = "ltd_life"
-        elif "misc" in cl: col_map[c] = "misc_costs"
-    df.rename(columns=col_map, inplace=True)
+        target = None
+        if cl == "name": target = "name"
+        elif "department" in cl: target = "department"
+        elif "job" in cl and "title" in cl: target = "job_title"
+        elif "total" in cl and "cash" in cl: target = "total_comp"
+        elif "base" in cl and "pay" in cl: target = "base_pay"
+        elif cl == "overtime" or cl.startswith("overtime"): target = "overtime"
+        elif "sick" in cl or "vacation" in cl: target = "sick_vacation"
+        elif "other" in cl and "cash" in cl: target = "other_cash"
+        elif "defined" in cl and "contribution" in cl: target = "dc_contributions"
+        elif "medical" in cl or "dental" in cl: target = "medical_dental"
+        elif "retirement" in cl: target = "retirement"
+        elif "long" in cl and "term" in cl: target = "ltd_life"
+        elif "misc" in cl and "employ" in cl: target = "misc_costs"
 
-    # Parse money columns (remove commas and $)
+        # Only map if we haven't already mapped to this target
+        if target and target not in seen_targets:
+            col_map[c] = target
+            seen_targets.add(target)
+
+    df = df.rename(columns=col_map)
+
+    # Remove any remaining duplicate columns after rename
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # Parse money columns safely
     money_cols = ["total_comp", "base_pay", "overtime", "sick_vacation", "other_cash",
                   "dc_contributions", "medical_dental", "retirement", "ltd_life", "misc_costs"]
     for col in money_cols:
         if col in df.columns:
-            df[col] = (
-                df[col].astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("$", "", regex=False)
-                .str.replace('"', "", regex=False)
-                .str.strip()
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+            df[col] = _clean_money(df[col])
 
     # Compute total benefits
     benefit_cols = [c for c in ["dc_contributions", "medical_dental", "retirement", "ltd_life", "misc_costs"] if c in df.columns]
     df["total_benefits"] = df[benefit_cols].sum(axis=1) if benefit_cols else 0
 
     # Compute total cost = total cash comp + total benefits
-    df["total_cost"] = df.get("total_comp", 0) + df["total_benefits"]
+    if "total_comp" in df.columns:
+        df["total_cost"] = df["total_comp"] + df["total_benefits"]
+    else:
+        df["total_cost"] = df["total_benefits"]
 
     # Overtime rate
     if "overtime" in df.columns and "base_pay" in df.columns:
